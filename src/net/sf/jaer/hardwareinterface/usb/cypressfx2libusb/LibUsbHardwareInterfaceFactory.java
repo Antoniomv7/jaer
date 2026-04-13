@@ -76,6 +76,8 @@ public class LibUsbHardwareInterfaceFactory implements HardwareInterfaceFactoryI
 //        addDeviceToMap(CypressFX2.VID_DVS128_ORIG_FX2_ONLY, CypressFX2.PID_TMPDIFF128_RETINA, CypressFX2TmpdiffRetinaHardwareInterface.class);
         addDeviceToMap(CypressFX2.VID_THESYCON_FX2_CPLD, CypressFX2.PID_COCHLEAAMS, CochleaAMS1cHardwareInterface.class);
 
+        addDeviceToMap((short) 0x0547, (short) 0x8801, CypressFX2LibUsbDVS128HardwareInterface.class);
+
         // Linux Drivers for PAER retina.
         if (System.getProperty("os.name").startsWith("Linux")) {
             addDeviceToMap(CypressFX2.VID_THESYCON_FX2_CPLD, SiLabsC8051F320_LibUsb_PAER.PID_PAER, SiLabsC8051F320_LibUsb_PAER.class);

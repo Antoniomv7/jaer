@@ -10,6 +10,11 @@ import java.beans.PropertyChangeEvent;
 import java.beans.PropertyChangeSupport;
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
+import java.time.Instant;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.prefs.Preferences;
@@ -340,6 +345,10 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
     private String stringDescription = "CypressFX2"; // default which is
     // modified by opening
     private USBPacketStatistics usbPacketStatistics = new USBPacketStatistics();
+    private final Set<Byte> unsupportedVendorOutRequests = Collections.synchronizedSet(new HashSet<Byte>());
+    private final Set<Byte> unsupportedVendorInRequests = Collections.synchronizedSet(new HashSet<Byte>());
+    private final Set<Byte> loggedUnsupportedVendorOutRequests = Collections.synchronizedSet(new HashSet<Byte>());
+    private final Set<Byte> loggedUnsupportedVendorInRequests = Collections.synchronizedSet(new HashSet<Byte>());
 
     /**
      * Populates the device descriptor and the string descriptors and builds the
@@ -849,6 +858,10 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
 
         USBTransferThread usbTransfer;
         CypressFX2 monitor;
+        private final boolean usbaermini2RuntimeDebug = Boolean.getBoolean("jaer.usbaermini2.debug");
+        private int statusTransferErrorCount = 0;
+        private int statusTransferStallCount = 0;
+        private long firstStatusTransferStallEpochMs = -1;
 
         AsyncStatusThread(final CypressFX2 monitor) {
             this.monitor = monitor;
@@ -872,12 +885,45 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
         }
 
         public void stopThread() {
+            if (usbTransfer == null) {
+                return;
+            }
             usbTransfer.interrupt();
+
+            if (Thread.currentThread() == usbTransfer) {
+                CypressFX2.log.warning("AsyncStatusThread.stopThread called from AsyncStatusThread; skipping join to avoid deadlock");
+                return;
+            }
 
             try {
                 usbTransfer.join();
             } catch (final InterruptedException e) {
                 CypressFX2.log.severe("Failed to join AsyncStatusThread");
+            }
+        }
+
+        private boolean isUsbaermini2Device() {
+            return (monitor.getVID_THESYCON_FX2_CPLD() == (short) 0x0547) && (monitor.getPID() == CypressFX2.PID_USBAERmini2);
+        }
+
+        private String transferStatusName(final int status) {
+            switch (status) {
+                case LibUsb.TRANSFER_COMPLETED:
+                    return "TRANSFER_COMPLETED";
+                case LibUsb.TRANSFER_ERROR:
+                    return "TRANSFER_ERROR";
+                case LibUsb.TRANSFER_TIMED_OUT:
+                    return "TRANSFER_TIMED_OUT";
+                case LibUsb.TRANSFER_CANCELLED:
+                    return "TRANSFER_CANCELLED";
+                case LibUsb.TRANSFER_STALL:
+                    return "TRANSFER_STALL";
+                case LibUsb.TRANSFER_NO_DEVICE:
+                    return "TRANSFER_NO_DEVICE";
+                case LibUsb.TRANSFER_OVERFLOW:
+                    return "TRANSFER_OVERFLOW";
+                default:
+                    return "TRANSFER_STATUS_" + status;
             }
         }
 
@@ -892,8 +938,25 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
             public void processTransfer(final RestrictedTransfer transfer) {
                 if (transfer.status() != LibUsb.TRANSFER_COMPLETED) {
                     if (transfer.status() != LibUsb.TRANSFER_CANCELLED) {
-                        CypressFX2.log.warning("Error waiting for completion of read on status pipe: "
-                                + LibUsb.errorName(transfer.status()));
+                        statusTransferErrorCount++;
+                        if (transfer.status() == LibUsb.TRANSFER_STALL) {
+                            statusTransferStallCount++;
+                            if (firstStatusTransferStallEpochMs < 0) {
+                                firstStatusTransferStallEpochMs = System.currentTimeMillis();
+                            }
+                        }
+                        final String firstStallText = (firstStatusTransferStallEpochMs < 0)
+                                ? "none"
+                                : Instant.ofEpochMilli(firstStatusTransferStallEpochMs).toString();
+                        if (isUsbaermini2Device() || usbaermini2RuntimeDebug) {
+                            CypressFX2.log.warning(String.format(
+                                    "AsyncStatusThread transfer error: status=%s, bytes=%d, errors=%d, stalls=%d, firstStall=%s",
+                                    transferStatusName(transfer.status()), transfer.actualLength(), statusTransferErrorCount,
+                                    statusTransferStallCount, firstStallText));
+                        } else {
+                            CypressFX2.log.warning("Error waiting for completion of read on status pipe: "
+                                    + LibUsb.errorName(transfer.status()));
+                        }
                     }
 
                     return;
@@ -1008,6 +1071,20 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
 
         USBTransferThread usbTransfer;
         CypressFX2 monitor;
+        private final boolean usbaermini2RuntimeDebug = Boolean.getBoolean("jaer.usbaermini2.debug");
+        private long transferWindowStartNs = System.nanoTime();
+        private long transferWindowBytes = 0;
+        private int transferWindowCount = 0;
+        private int transferWindowCompleted = 0;
+        private int transferWindowErrors = 0;
+        private int transferWindowDecodedEvents = 0;
+        private int transferStallCount = 0;
+        private int transferErrorCount = 0;
+        private long firstStallEpochMs = -1;
+        private int consecutiveTransferErrors = 0;
+        private final AtomicBoolean recoveryInProgress = new AtomicBoolean(false);
+        private static final int MAX_CONSECUTIVE_TRANSFER_ERRORS_BEFORE_RECOVERY = 3;
+        private static final int MAX_TRANSFER_ERRORS_BEFORE_RECOVERY = 8;
 
         public AEReader(final CypressFX2 m) throws HardwareInterfaceException {
             monitor = m;
@@ -1026,11 +1103,20 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
             }
 
             CypressFX2.log.info("Starting AEReader");
+            resetTransferRuntimeStats();
             usbTransfer = new USBTransferThread(monitor.deviceHandle, (byte) 0x86, LibUsb.TRANSFER_TYPE_BULK,
                     new ProcessAEData(), getNumBuffers(), getFifoSize(), null, null, new Runnable() {
                 @Override
                 public void run() {
-                    monitor.close();
+                    // Keep close on a separate thread to avoid calling stop/join from inside USB callback context.
+                    final Thread closeThread = new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            monitor.close();
+                        }
+                    }, "CypressFX2-AEReaderClose-" + System.currentTimeMillis());
+                    closeThread.setDaemon(true);
+                    closeThread.start();
                 }
             });
             usbTransfer.setName("AEReaderThread");
@@ -1040,7 +1126,15 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
         }
 
         public void stopThread() {
+            if (usbTransfer == null) {
+                return;
+            }
             usbTransfer.interrupt();
+
+            if (Thread.currentThread() == usbTransfer) {
+                CypressFX2.log.warning("AEReader.stopThread called from AEReaderThread; skipping join to avoid deadlock");
+                return;
+            }
 
             try {
                 usbTransfer.join();
@@ -1086,6 +1180,137 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
             // are reset
         }
 
+        private boolean isUsbaermini2Device() {
+            return (monitor.getVID_THESYCON_FX2_CPLD() == (short) 0x0547) && (monitor.getPID() == CypressFX2.PID_USBAERmini2);
+        }
+
+        private String transferStatusName(final int status) {
+            switch (status) {
+                case LibUsb.TRANSFER_COMPLETED:
+                    return "TRANSFER_COMPLETED";
+                case LibUsb.TRANSFER_ERROR:
+                    return "TRANSFER_ERROR";
+                case LibUsb.TRANSFER_TIMED_OUT:
+                    return "TRANSFER_TIMED_OUT";
+                case LibUsb.TRANSFER_CANCELLED:
+                    return "TRANSFER_CANCELLED";
+                case LibUsb.TRANSFER_STALL:
+                    return "TRANSFER_STALL";
+                case LibUsb.TRANSFER_NO_DEVICE:
+                    return "TRANSFER_NO_DEVICE";
+                case LibUsb.TRANSFER_OVERFLOW:
+                    return "TRANSFER_OVERFLOW";
+                default:
+                    return "TRANSFER_STATUS_" + status;
+            }
+        }
+
+        private boolean isTransferErrorStatus(final int transferStatus) {
+            return (transferStatus != LibUsb.TRANSFER_COMPLETED) && (transferStatus != LibUsb.TRANSFER_CANCELLED);
+        }
+
+        private void resetTransferRuntimeStats() {
+            transferWindowStartNs = System.nanoTime();
+            transferWindowBytes = 0;
+            transferWindowCount = 0;
+            transferWindowCompleted = 0;
+            transferWindowErrors = 0;
+            transferWindowDecodedEvents = 0;
+            transferStallCount = 0;
+            transferErrorCount = 0;
+            firstStallEpochMs = -1;
+            consecutiveTransferErrors = 0;
+        }
+
+        private void updateTransferRuntimeStats(final int transferStatus, final int bytesTransferred, final int decodedEventsDelta) {
+            transferWindowCount++;
+            transferWindowBytes += bytesTransferred;
+            if (transferStatus == LibUsb.TRANSFER_COMPLETED) {
+                transferWindowCompleted++;
+            } else if (isTransferErrorStatus(transferStatus)) {
+                transferWindowErrors++;
+            }
+            if (decodedEventsDelta > 0) {
+                transferWindowDecodedEvents += decodedEventsDelta;
+            }
+
+            if (!isUsbaermini2Device() || !usbaermini2RuntimeDebug) {
+                return;
+            }
+
+            final long nowNs = System.nanoTime();
+            final long dtNs = nowNs - transferWindowStartNs;
+            if (dtNs < 1_000_000_000L) {
+                return;
+            }
+
+            final long bytesPerSecond = Math.round((transferWindowBytes * 1_000_000_000d) / dtNs);
+            final long eventsPerSecond = Math.round((transferWindowDecodedEvents * 1_000_000_000d) / dtNs);
+            final double avgTransferBytes = (transferWindowCount == 0) ? 0d : (transferWindowBytes / (double) transferWindowCount);
+            final String firstStallText = (firstStallEpochMs < 0)
+                    ? "none"
+                    : Instant.ofEpochMilli(firstStallEpochMs).toString();
+
+            CypressFX2.log.info(String.format(
+                    "USBAERmini2 runtime: eventsPerSec=%d, bytesPerSec=%d, transfers=%d, completed=%d, errors=%d, avgBytesPerTransfer=%.1f, stalls=%d, firstStall=%s",
+                    eventsPerSecond, bytesPerSecond, transferWindowCount, transferWindowCompleted, transferWindowErrors,
+                    avgTransferBytes, transferStallCount, firstStallText));
+
+            transferWindowStartNs = nowNs;
+            transferWindowBytes = 0;
+            transferWindowCount = 0;
+            transferWindowCompleted = 0;
+            transferWindowErrors = 0;
+            transferWindowDecodedEvents = 0;
+        }
+
+        private boolean tryClearInEndpointHalt() {
+            if (monitor.deviceHandle == null) {
+                return false;
+            }
+            final int clearStatus = LibUsb.clearHalt(monitor.deviceHandle, CypressFX2.AE_MONITOR_ENDPOINT_ADDRESS);
+            if (clearStatus == LibUsb.SUCCESS) {
+                CypressFX2.log.warning(String.format(
+                        "AEReader transfer recovery: cleared HALT on endpoint 0x%02X, will continue streaming",
+                        CypressFX2.AE_MONITOR_ENDPOINT_ADDRESS & 0xFF));
+                try {
+                    monitor.requestEarlyTransfer();
+                } catch (final HardwareInterfaceException e) {
+                    CypressFX2.log.warning("AEReader transfer recovery: requestEarlyTransfer after clearHalt failed: " + e.toString());
+                }
+                return true;
+            }
+            CypressFX2.log.warning(String.format(
+                    "AEReader transfer recovery: clearHalt failed on endpoint 0x%02X with %s",
+                    CypressFX2.AE_MONITOR_ENDPOINT_ADDRESS & 0xFF, LibUsb.errorName(clearStatus)));
+            return false;
+        }
+
+        private void scheduleRecoveryAfterTransferError(final String reason) {
+            if (!recoveryInProgress.compareAndSet(false, true)) {
+                return;
+            }
+            final Thread recoveryThread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        CypressFX2.log.warning("AEReader transfer recovery: starting device reopen sequence, reason=" + reason);
+                        monitor.close();
+                        monitor.open();
+                        monitor.setEventAcquisitionEnabled(true);
+                        CypressFX2.log.warning("AEReader transfer recovery: device reopen sequence completed");
+                        consecutiveTransferErrors = 0;
+                    } catch (final Exception e) {
+                        CypressFX2.log.severe("AEReader transfer recovery failed: " + e.toString());
+                    } finally {
+                        recoveryInProgress.set(false);
+                    }
+                }
+            }, "CypressFX2-Recovery-" + System.currentTimeMillis());
+            recoveryThread.setDaemon(true);
+            recoveryThread.start();
+        }
+
         class ProcessAEData implements RestrictedTransferCallback {
 
             @Override
@@ -1101,13 +1326,24 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
              */
             @Override
             public void processTransfer(final RestrictedTransfer transfer) {
+                final int transferStatus = transfer.status();
+                final int bytesTransferred = transfer.actualLength();
+                int decodedEventsDelta = 0;
                 cycleCounter++;
                 usbPacketStatistics.addSample(transfer);
 
                 synchronized (aePacketRawPool) {
-                    if ((transfer.status() == LibUsb.TRANSFER_COMPLETED)
-                            || (transfer.status() == LibUsb.TRANSFER_CANCELLED)) {
+                    if ((transferStatus == LibUsb.TRANSFER_COMPLETED)
+                            || (transferStatus == LibUsb.TRANSFER_CANCELLED)) {
+                        final int eventCounterBefore = eventCounter;
                         translateEvents(transfer.buffer());
+                        decodedEventsDelta = eventCounter - eventCounterBefore;
+                        if (decodedEventsDelta < 0) {
+                            decodedEventsDelta = 0;
+                        }
+                        if (transferStatus == LibUsb.TRANSFER_COMPLETED) {
+                            consecutiveTransferErrors = 0;
+                        }
 
                         if ((chip != null) && (chip.getFilterChain() != null)
                                 && (chip.getFilterChain().getProcessingMode() == FilterChain.ProcessingMode.ACQUISITION)) {
@@ -1128,8 +1364,47 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
                             realTimeFilter(addresses, timestamps);
                         }
                     } else {
-                        CypressFX2.log.warning("ProcessAEData: Bytes transferred: " + transfer.actualLength()
-                                + "  Status: " + LibUsb.errorName(transfer.status()));
+                        if (isUsbaermini2Device()) {
+                            transferErrorCount++;
+                            consecutiveTransferErrors++;
+                            if (transferStatus == LibUsb.TRANSFER_STALL) {
+                                transferStallCount++;
+                                if (firstStallEpochMs < 0) {
+                                    firstStallEpochMs = System.currentTimeMillis();
+                                }
+                            }
+
+                            final String firstStallText = (firstStallEpochMs < 0)
+                                    ? "none"
+                                    : Instant.ofEpochMilli(firstStallEpochMs).toString();
+                            CypressFX2.log.warning(String.format(
+                                    "ProcessAEData transfer error: status=%s, bytes=%d, errors=%d, stalls=%d, consecutive=%d, firstStall=%s",
+                                    transferStatusName(transferStatus), bytesTransferred, transferErrorCount, transferStallCount,
+                                    consecutiveTransferErrors, firstStallText));
+
+                            boolean recoveredByClearHalt = false;
+                            if ((transferStatus == LibUsb.TRANSFER_STALL) || (transferStatus == LibUsb.TRANSFER_ERROR)
+                                    || (transferStatus == LibUsb.TRANSFER_OVERFLOW)) {
+                                recoveredByClearHalt = tryClearInEndpointHalt();
+                                if (recoveredByClearHalt) {
+                                    consecutiveTransferErrors = 0;
+                                }
+                            }
+
+                            final boolean shouldReopen = !recoveredByClearHalt
+                                    && ((consecutiveTransferErrors >= MAX_CONSECUTIVE_TRANSFER_ERRORS_BEFORE_RECOVERY)
+                                            || (transferErrorCount >= MAX_TRANSFER_ERRORS_BEFORE_RECOVERY)
+                                            || (transferStatus == LibUsb.TRANSFER_NO_DEVICE));
+                            if (shouldReopen) {
+                                scheduleRecoveryAfterTransferError(String.format(
+                                        "status=%s, bytes=%d, errors=%d, stalls=%d, consecutive=%d",
+                                        transferStatusName(transferStatus), bytesTransferred, transferErrorCount,
+                                        transferStallCount, consecutiveTransferErrors));
+                            }
+                        } else {
+                            CypressFX2.log.warning("ProcessAEData: Bytes transferred: " + bytesTransferred
+                                    + "  Status: " + LibUsb.errorName(transferStatus));
+                        }
                     }
 
                     if (timestampsReset) {
@@ -1138,6 +1413,8 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
                         timestampsReset = false;
                     }
                 }
+
+                updateTransferRuntimeStats(transferStatus, bytesTransferred, decodedEventsDelta);
             }
         }
 
@@ -1749,6 +2026,45 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
         return lastEventsAcquired;
     }
 
+    private short safeDid() {
+        if (deviceDescriptor == null) {
+            return 0;
+        }
+        return deviceDescriptor.bcdDevice();
+    }
+
+    private String requestToHex(final byte request) {
+        return String.format("0x%02X", request & 0xFF);
+    }
+
+    private boolean isVendorOutRequestUnsupported(final byte request) {
+        return unsupportedVendorOutRequests.contains(Byte.valueOf(request));
+    }
+
+    private boolean isVendorInRequestUnsupported(final byte request) {
+        return unsupportedVendorInRequests.contains(Byte.valueOf(request));
+    }
+
+    private void markVendorOutRequestUnsupported(final byte request) {
+        final Byte req = Byte.valueOf(request);
+        unsupportedVendorOutRequests.add(req);
+        if (loggedUnsupportedVendorOutRequests.add(req)) {
+            CypressFX2.log.warning(String.format(
+                    "Marking vendor OUT request %s unsupported for DID=0x%04X after LIBUSB_ERROR_PIPE; future attempts will be skipped",
+                    requestToHex(request), safeDid() & 0xFFFF));
+        }
+    }
+
+    private void markVendorInRequestUnsupported(final byte request) {
+        final Byte req = Byte.valueOf(request);
+        unsupportedVendorInRequests.add(req);
+        if (loggedUnsupportedVendorInRequests.add(req)) {
+            CypressFX2.log.warning(String.format(
+                    "Marking vendor IN request %s unsupported for DID=0x%04X after LIBUSB_ERROR_PIPE; future attempts will not be retried",
+                    requestToHex(request), safeDid() & 0xFFFF));
+        }
+    }
+
     /**
      * Sends a vendor request without any data packet, value and index are set
      * to zero. This is a blocking method.
@@ -1828,6 +2144,14 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
         if (!isOpen()) {
             open();
         }
+        if (isVendorOutRequestUnsupported(request)) {
+            if (loggedUnsupportedVendorOutRequests.add(Byte.valueOf(request))) {
+                CypressFX2.log.warning(String.format(
+                        "Skipping previously unsupported vendor OUT request %s for DID=0x%04X",
+                        requestToHex(request), safeDid() & 0xFFFF));
+            }
+            return;
+        }
 
         if (dataBuffer == null) {
             dataBuffer = BufferUtils.allocateByteBuffer(0);
@@ -1837,6 +2161,9 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
 
         final int status = LibUsb.controlTransfer(deviceHandle, bmRequestType, request, value, index, dataBuffer, 0);
         if (status < LibUsb.SUCCESS) {
+            if (status == LibUsb.ERROR_PIPE) {
+                markVendorOutRequestUnsupported(request);
+            }
             throw new HardwareInterfaceException("Unable to send vendor OUT request " + String.format("0x%x", request)
                     + ": " + LibUsb.errorName(status));
         }
@@ -1868,6 +2195,11 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
         if (!isOpen()) {
             open();
         }
+        if (isVendorInRequestUnsupported(request)) {
+            throw new HardwareInterfaceException(String.format(
+                    "Vendor IN request %s previously marked unsupported for DID=0x%04X due to LIBUSB_ERROR_PIPE",
+                    requestToHex(request), safeDid() & 0xFFFF));
+        }
 
         final ByteBuffer dataBuffer = BufferUtils.allocateByteBuffer(dataLength);
 
@@ -1875,6 +2207,9 @@ public class CypressFX2 implements AEMonitorInterface, ReaderBufferControl, USBI
 
         final int status = LibUsb.controlTransfer(deviceHandle, bmRequestType, request, value, index, dataBuffer, 0);
         if (status < LibUsb.SUCCESS) {
+            if (status == LibUsb.ERROR_PIPE) {
+                markVendorInRequestUnsupported(request);
+            }
             throw new HardwareInterfaceException("Unable to send vendor IN request " + String.format("0x%x", request)
                     + ": " + LibUsb.errorName(status));
         }
